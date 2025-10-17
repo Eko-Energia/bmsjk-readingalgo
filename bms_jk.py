@@ -2,187 +2,130 @@ import serial
 import time
 
 
-def jk_bms_protocol_analyzer():
-    print("🔍 JK BMS - ANALIZATOR PROTOKOŁU")
-    print("=" * 50)
-
-    port = "COM28"
-    baud = 115200
-
-    # Komendy do testowania
-    commands = {
-        "SOC": "4E57001300000000030300850000000068000001AB",
-        "Voltage": "4E57001300000000030300830000000068000001A9",
-        "Current": "4E57001300000000030300840000000068000001AA",
-        "Temperature": "4E57001300000000030300810000000068000001A7",
-        "Capacity": "4E57001300000000030300AA0000000068000001D0",
-    }
-
-    try:
-        ser = serial.Serial(port, baud, timeout=1, write_timeout=1)
-        print(f"📡 Połączono z BMS")
-        print("-" * 60)
-
-        for name, cmd_hex in commands.items():
-            print(f"\n🎯 {name}:")
-
-            ser.reset_input_buffer()
-            ser.write(bytes.fromhex(cmd_hex))
-            time.sleep(0.5)
-
-            if ser.in_waiting > 0:
-                response = ser.read(ser.in_waiting)
-
-                if response[:2] == b"\x4e\x57":  # Ramka JK
-                    print(f"   📦 Odebrano: {len(response)} bajtów")
-                    print(f"   🔢 HEX: {response.hex().upper()}")
-
-                    # Pokazuj strukturę ramki
-                    print(f"   🏗️  Struktura ramki:")
-                    for i in range(0, len(response), 8):
-                        line = ""
-                        for j in range(8):
-                            if i + j < len(response):
-                                byte = response[i + j]
-                                marker = " "
-                                if i + j == 10:
-                                    marker = "Ⓣ"  # Typ?
-                                elif i + j >= 11 and i + j <= 14:
-                                    marker = "Ⓓ"  # Dane?
-                                line += f"[{i+j:2d}]0x{byte:02X}{marker} "
-                        if line:
-                            print(f"      {line}")
-
-                else:
-                    print(f"   ❌ Nieprawidłowa ramka JK")
-
-            else:
-                print(f"   ⚠️  Brak odpowiedzi")
-
-        ser.close()
-
-    except Exception as e:
-        print(f"💥 Błąd: {e}")
+def parse_cell_voltages(response):
+    """
+    Szuka w ramce znacznika 0x79 i jeśli znajdzie:
+    - następny bajt = length (L)
+    - potem L bajtów zawiera 3*n grup: [cell_idx][volt_hi][volt_lo]
+    Zwraca listę (cell_idx, volt_mV, volt_V_str)
+    """
+    cells = []
+    i = 0
+    while i < len(response):
+        if response[i] == 0x79 and i + 1 < len(response):
+            length = response[i + 1]
+            start = i + 2
+            end = start + length
+            if end > len(response):
+                break
+            data = response[start:end]
+            for g in range(len(data) // 3):
+                base = g * 3
+                cell_idx = data[base]
+                volt_hi = data[base + 1]
+                volt_lo = data[base + 2]
+                volt_mV = (volt_hi << 8) | volt_lo
+                volt_V = volt_mV / 1000.0
+                cells.append((cell_idx, volt_mV, f"{volt_V:.3f} V"))
+            return i, length, cells
+        i += 1
+    return None
 
 
 def find_data_in_frame(response, param_name):
-    """Znajduje dane w ramce odpowiedzi"""
+    """Znajduje dane w ramce odpowiedzi (SOC, Voltage, Current, Temperature, Capacity)"""
     if len(response) < 12:
         return None
 
-    # Przeszukaj różne pozycje w ramce
-    search_positions = [
-        (10, 1, "1B"),  # Pozycja 10, 1 bajt
-        (11, 1, "1B"),  # Pozycja 11, 1 bajt
-        (12, 1, "1B"),  # Pozycja 12, 1 bajt
-        (10, 2, "2B"),  # Pozycja 10, 2 bajty
-        (11, 2, "2B"),  # Pozycja 11, 2 bajty
-        (12, 2, "2B"),  # Pozycja 12, 2 bajty
-        (13, 2, "2B"),  # Pozycja 13, 2 bajty
-        (11, 4, "4B"),  # Pozycja 11, 4 bajty
-    ]
+    for pos in range(len(response) - 2):
+        try:
+            b0 = response[pos]
+            b1 = response[(pos + 1)]
 
-    for pos, length, desc in search_positions:
-        if pos + length <= len(response):
-            data_bytes = response[pos : pos + length]
+            if param_name == "SOC" and 0 <= b0 <= 100:
+                return pos, f"{b0}%", bytes([b0])
 
-            if param_name == "SOC" and length == 1:
-                value = data_bytes[0]
-                if 0 <= value <= 100:  # SOC musi być 0-100%
-                    return pos, f"{value}%", data_bytes
-
-            elif param_name == "Voltage" and length == 2:
-                raw = (data_bytes[0] << 8) + data_bytes[1]
+            elif param_name == "Voltage":
+                raw = (b0 << 8) + b1
                 voltage = raw * 0.01
                 if 20 <= voltage <= 30:  # Napięcie LiFePO4
-                    return pos, f"{voltage:.2f}V", data_bytes
+                    return pos, f"{voltage:.2f}V", bytes([b0, b1])
 
-            elif param_name == "Current" and length == 2:
-                raw = (data_bytes[0] << 8) + data_bytes[1]
-                if raw & 0x8000:
-                    raw = raw - 65536  # Signed
-                current = raw * 0.01
-                if -100 <= current <= 100:  # Prąd w rozsądnym zakresie
-                    direction = "↗️" if current < 0 else "↘️" if current > 0 else "⏸️"
-                    return pos, f"{current:+.2f}A {direction}", data_bytes
+            elif param_name == "Current":
+                raw = (b0 << 8) | b1
+                sign = -1 if raw & 0x8000 else 1
+                value = raw & 0x7FFF
+                current = sign * value * 0.01
+                if -200 <= current <= 200:
+                    direction = "↗️" if current > 0 else "↘️"
+                    return pos, f"{current:+.2f} A {direction}", bytes([b0, b1])
+ 
+            elif param_name == "Temperature":
+                raw = (b0 << 8) | b1
+                if -40 <= raw <= 150:
+                    return pos, f"{raw} °C", bytes([b0, b1])
 
-            elif param_name == "Temperature" and length == 2:
-                raw = (data_bytes[0] << 8) + data_bytes[1]
-                if -20 <= raw <= 100:  # Temperatura
-                    return pos, f"{raw}°C", data_bytes
-
-            elif param_name == "Capacity" and length == 4:
-                raw = (
-                    (data_bytes[0] << 24)
-                    + (data_bytes[1] << 16)
-                    + (data_bytes[2] << 8)
-                    + data_bytes[3]
-                )
-                if 0 <= raw <= 1000:  # Pojemność w Ah
-                    return pos, f"{raw}Ah", data_bytes
+        except:
+            continue
 
     return None
 
 
-def jk_bms_data_mapper():
-    """Mapuje gdzie są jakie dane w ramkach"""
-    print("\n🗺️  MAPOWANIE DANYCH W RAMKACH")
-    print("=" * 50)
+def jk_bms_protocol_analyzer():
+    print("🔍 JK BMS - ANALIZATOR PROTOKOŁU")
+    print("=" * 60)
 
     port = "COM28"
     baud = 115200
 
+    # ✅ Dodano: ramka 'AllStatus' do pełnego odczytu danych oraz 'CellVoltages' (0x79)
     commands = {
         "SOC": "4E57001300000000030300850000000068000001AB",
         "Voltage": "4E57001300000000030300830000000068000001A9",
-        "Current": "4E57001300000000030300840000000068000001AA",
+        "Current": "4E57001300000000030300840000000068000001AA", 
+        "Temperature": "4E57001300000000030300810000000068000001A7",
+        "Capacity": "4E57001300000000030300AA0000000068000001D0",  # nie działa
+        "CellVoltages": "4E570013000000000303007900000000680000019F",
     }
 
     try:
         ser = serial.Serial(port, baud, timeout=1, write_timeout=1)
-
-        print("📊 Odkrywanie pozycji danych:")
-        print("-" * 45)
-
-        data_map = {}
+        print(f"📡 Połączono z BMS na {port} @ {baud}")
+        print("-" * 60)
 
         for name, cmd_hex in commands.items():
+            print(f"\n🎯 {name}:")
             ser.reset_input_buffer()
             ser.write(bytes.fromhex(cmd_hex))
             time.sleep(0.5)
 
             if ser.in_waiting > 0:
                 response = ser.read(ser.in_waiting)
+                print(f"   📦 Odebrano: {len(response)} bajtów")
+                print(f"   🔢 HEX: {response.hex().upper()}")
 
-                if response[:2] == b"\x4e\x57":
-                    # Szukaj danych
-                    found = find_data_in_frame(response, name)
-                    if found:
-                        pos, value, bytes_data = found
-                        data_map[name] = {
-                            "position": pos,
-                            "length": len(bytes_data),
-                            "value": value,
-                            "bytes": bytes_data.hex().upper(),
-                        }
-                        print(f"✅ {name}:")
-                        print(f"   📍 Pozycja: {pos}")
-                        print(f"   📏 Długość: {len(bytes_data)} bajtów")
-                        print(f"   💾 Bajty: {bytes_data.hex().upper()}")
-                        print(f"   💡 Wartość: {value}")
-                    else:
-                        print(f"❌ {name}: Nie znaleziono danych")
+                # Sprawdź czy ramka zawiera napięcia ogniw
+                cellinfo = parse_cell_voltages(response)
+                if cellinfo:
+                    pos, length, cells = cellinfo
+                    print(
+                        f"   🔋 Zidentyfikowano blok napięć ogniw @ pos {pos}, len={length}"
+                    )
+                    for idx, mV, vstr in cells:
+                        print(f"      Cell {idx}: {mV} mV -> {vstr}")
 
-        # Podsumowanie mapowania
-        if data_map:
-            print(f"\n🎯 MAPA DANYCH:")
-            print("-" * 35)
-            for name, info in data_map.items():
-                print(f"   {name}:")
-                print(f"      → Pozycja: {info['position']}")
-                print(f"      → Długość: {info['length']}B")
-                print(f"      → Wartość: {info['value']}")
-                print(f"      → HEX: {info['bytes']}")
+                found = find_data_in_frame(
+                    response, name if name != "CellVoltages" else "Voltage"
+                )
+                if found:
+                    pos, value, bytes_data = found
+                    print(f"   ✅ {name} parsed:")
+                    print(f"      📍 pos: {pos}, bytes: {bytes_data.hex().upper()}")
+                    print(f"      💡 value: {value}")
+                else:
+                    print(f"   ℹ️  Nie wykryto standardowego pola dla {name}")
+            else:
+                print("   ⚠️  Brak odpowiedzi")
 
         ser.close()
 
@@ -190,7 +133,5 @@ def jk_bms_data_mapper():
         print(f"💥 Błąd: {e}")
 
 
-# Uruchom analizę
 if __name__ == "__main__":
     jk_bms_protocol_analyzer()
-    jk_bms_data_mapper()
